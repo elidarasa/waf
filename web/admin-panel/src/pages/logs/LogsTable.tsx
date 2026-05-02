@@ -1,8 +1,24 @@
-import { Table, Tag, Typography, Space, Button } from "antd";
-import { FilterOutlined } from "@ant-design/icons";
-import type { ColumnsType } from "antd/es/table";
+import { useEffect, useMemo, useState } from "react";
+import { Table, Typography } from "antd";
+import type { ColumnType, ColumnsType } from "antd/es/table";
+import {
+  DndContext,
+  type DragEndEvent,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { restrictToHorizontalAxis } from "@dnd-kit/modifiers";
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
-import { fmtDateTime } from "../../utils/format";
+import { LogsColumnsPicker } from "./LogsColumnsPicker";
+import { buildBuiltinColumns, renderGenericCell } from "./LogsColumns";
 
 // Each row is a free-form JSON object (NDJSON line from VictoriaLogs). We
 // type the well-known shape but tolerate extra fields in the expand row.
@@ -28,22 +44,13 @@ export interface LogRow {
   [extra: string]: unknown;
 }
 
-const eventTypeColor = (eventType: string | undefined): string => {
-  switch (eventType) {
-    case "block":
-      return "red";
-    case "rate_limit":
-      return "gold";
-    case "challenge":
-      return "purple";
-    case "log_only":
-      return "blue";
-    case "allow":
-      return "green";
-    default:
-      return "default";
-  }
-};
+/** localStorage key for persisted column state. Bump suffix on schema break. */
+const LS_KEY = "prx-waf:logs:columns:v1";
+
+interface PersistedShape {
+  visible?: unknown;
+  custom?: unknown;
+}
 
 interface Props {
   rows: LogRow[];
@@ -64,113 +71,227 @@ export const LogsTable: React.FC<Props> = ({
   onFilterClientIp,
   onFilterRuleName,
 }) => {
-  const columns: ColumnsType<LogRow> = [
-    {
-      title: "Time",
-      dataIndex: "_time",
-      width: 180,
-      render: (v: string | undefined) => (
-        <span style={{ color: "#8c8c8c", fontSize: 12 }}>{v ? fmtDateTime(v) : "—"}</span>
-      ),
-    },
-    {
-      title: "Event",
-      dataIndex: "event_type",
-      width: 100,
-      render: (v: string | undefined) =>
-        v ? <Tag color={eventTypeColor(v)}>{v}</Tag> : <Tag>—</Tag>,
-    },
-    {
-      title: "Rule",
-      dataIndex: "rule_name",
-      width: 200,
-      ellipsis: true,
-      render: (v: string | undefined) =>
-        v ? (
-          <Space size={4}>
-            <span title={v}>{v}</span>
-            <Button
-              size="small"
-              type="text"
-              icon={<FilterOutlined />}
-              onClick={() => onFilterRuleName(v)}
-              title="Filter by this rule"
-            />
-          </Space>
-        ) : (
-          "—"
-        ),
-    },
-    {
-      title: "Client IP",
-      dataIndex: "client_ip",
-      width: 170,
-      render: (v: string | undefined) =>
-        v ? (
-          <Space size={4}>
-            <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }}>{v}</span>
-            <Button
-              size="small"
-              type="text"
-              icon={<FilterOutlined />}
-              onClick={() => onFilterClientIp(v)}
-              title="Filter by this IP"
-            />
-          </Space>
-        ) : (
-          "—"
-        ),
-    },
-    { title: "Host", dataIndex: "host", width: 160, ellipsis: true },
-    {
-      title: "Tier",
-      dataIndex: "tier",
-      width: 100,
-      render: (v: string | undefined) => (v ? <Tag>{v}</Tag> : "—"),
-    },
-    {
-      title: "Detail",
-      dataIndex: "detail",
-      ellipsis: true,
-      render: (v, row) => {
-        const display = v ?? row._msg;
-        return (
-          <span
-            style={{ fontFamily: "ui-monospace, monospace", fontSize: 12 }}
-            title={typeof display === "string" ? display : ""}
-          >
-            {display ?? "—"}
-          </span>
-        );
-      },
-    },
-  ];
+  const builtins = useMemo(
+    () => buildBuiltinColumns(onFilterClientIp, onFilterRuleName),
+    [onFilterClientIp, onFilterRuleName],
+  );
+  const builtinIds = useMemo(() => builtins.map((c) => c.id), [builtins]);
+  const builtinLabels = useMemo(
+    () => Object.fromEntries(builtins.map((c) => [c.id, c.label])),
+    [builtins],
+  );
+
+  // Persisted state — survives reloads via localStorage.
+  const [visible, setVisible] = useState<string[]>(() => loadVisible(builtinIds));
+  const [customIds, setCustomIds] = useState<string[]>(() => loadCustom());
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({ visible, custom: customIds }));
+    } catch {
+      // localStorage may be unavailable / full / blocked — non-fatal.
+    }
+  }, [visible, customIds]);
+
+  // Discover field names from the *current* page of rows. Excludes anything
+  // already pinned and any internal `__*` key (e.g. `__rowKey`).
+  const discoveredIds = useMemo(() => {
+    const known = new Set([...builtinIds, ...customIds]);
+    const set = new Set<string>();
+    for (const r of rows) {
+      for (const key of Object.keys(r)) {
+        if (key.startsWith("__")) continue;
+        if (known.has(key)) continue;
+        set.add(key);
+      }
+    }
+    return Array.from(set).sort();
+  }, [rows, builtinIds, customIds]);
+
+  const handlePickerChange = (nextVisible: string[], nextCustom: string[]) => {
+    setVisible(nextVisible);
+    setCustomIds(nextCustom);
+  };
+
+  const handleReset = () => {
+    setVisible(builtinIds);
+    setCustomIds([]);
+  };
+
+  // Build the AntD columns array from `visible`. Built-in ids → use the
+  // pre-defined renderer. Anything else → render generically. Each column
+  // also carries `onHeaderCell` so DnD can pick up its drag id.
+  const columns: ColumnsType<LogRow> = useMemo(() => {
+    return visible.map((id): ColumnType<LogRow> => {
+      const base: ColumnType<LogRow> = (() => {
+        const builtin = builtins.find((c) => c.id === id);
+        if (builtin) return { ...builtin.def, key: id };
+        return {
+          title: <code style={{ fontSize: 12 }}>{id}</code>,
+          dataIndex: id,
+          key: id,
+          width: 180,
+          ellipsis: true,
+          render: renderGenericCell,
+        };
+      })();
+      return { ...base, onHeaderCell: () => ({ id } as React.HTMLAttributes<HTMLElement>) };
+    });
+  }, [visible, builtins]);
+
+  // ── Drag-and-drop reordering ──────────────────────────────────────────
+  // PointerSensor with a small activation distance prevents accidental
+  // drags on click — important because we want regular clicks on the
+  // header row (e.g. AntD's column-resize handle in future) to keep working.
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    setVisible((prev) => {
+      const fromIdx = prev.indexOf(String(active.id));
+      const toIdx = prev.indexOf(String(over.id));
+      if (fromIdx < 0 || toIdx < 0) return prev;
+      return arrayMove(prev, fromIdx, toIdx);
+    });
+  };
 
   return (
-    <Table<LogRow>
-      rowKey="__rowKey"
-      size="small"
-      dataSource={rows}
-      columns={columns}
-      loading={loading}
-      pagination={{
-        pageSize,
-        showSizeChanger: true,
-        pageSizeOptions: [50, 100, 500],
-        onShowSizeChange: (_c, ps) => setPageSize(ps),
-        showTotal: (n) => `Total: ${n}`,
-      }}
-      expandable={{
-        expandedRowRender: (row) => (
-          <Typography.Paragraph style={{ marginBottom: 0 }}>
-            <pre style={{ fontSize: 12, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {JSON.stringify(row, null, 2)}
-            </pre>
-          </Typography.Paragraph>
-        ),
-      }}
-      scroll={{ x: 1200 }}
-      locale={{ emptyText: "No log entries match your filters" }}
+    <DndContext
+      sensors={sensors}
+      modifiers={[restrictToHorizontalAxis]}
+      onDragEnd={handleDragEnd}
+    >
+      <SortableContext items={visible} strategy={horizontalListSortingStrategy}>
+        <Table<LogRow>
+          rowKey="__rowKey"
+          size="small"
+          dataSource={rows}
+          columns={columns}
+          loading={loading}
+          components={{ header: { cell: SortableHeaderCell } }}
+          title={() => (
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span style={{ color: "#8c8c8c", fontSize: 12 }}>
+                {rows.length === 0 ? "No entries" : `${rows.length} entries`}
+                <span style={{ marginLeft: 12, color: "#bfbfbf" }}>
+                  Drag a column header to reorder
+                </span>
+              </span>
+              <LogsColumnsPicker
+                builtinIds={builtinIds}
+                builtinLabels={builtinLabels}
+                customIds={customIds}
+                discoveredIds={discoveredIds}
+                visible={visible}
+                onChange={handlePickerChange}
+                onReset={handleReset}
+              />
+            </div>
+          )}
+          pagination={{
+            pageSize,
+            showSizeChanger: true,
+            pageSizeOptions: [50, 100, 500],
+            onShowSizeChange: (_c, ps) => setPageSize(ps),
+            showTotal: (n) => `Total: ${n}`,
+          }}
+          expandable={{
+            expandedRowRender: (row) => (
+              <Typography.Paragraph style={{ marginBottom: 0 }}>
+                <pre
+                  style={{
+                    fontSize: 12,
+                    margin: 0,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {JSON.stringify(row, null, 2)}
+                </pre>
+              </Typography.Paragraph>
+            ),
+          }}
+          scroll={{ x: 1200 }}
+          locale={{ emptyText: "No log entries match your filters" }}
+        />
+      </SortableContext>
+    </DndContext>
+  );
+};
+
+// ── Sortable header cell ────────────────────────────────────────────────────
+
+/**
+ * Replacement `<th>` registered via `Table.components.header.cell`.
+ *
+ * AntD calls this with the props returned from each column's
+ * `onHeaderCell`, so `id` is the column key. When `id` is missing
+ * (e.g. AntD's selection / expand columns) we render a plain `<th>`
+ * to stay out of the DnD context.
+ */
+type SortableHeaderProps = React.HTMLAttributes<HTMLTableCellElement> & { id?: string };
+
+const SortableHeaderCell: React.FC<SortableHeaderProps> = ({ id, style, ...rest }) => {
+  // Hooks MUST run unconditionally — we always call `useSortable`, but
+  // pass an unreachable id when there's no column key so the slot stays
+  // inert and AntD's auxiliary header cells render normally.
+  const sortable = useSortable({ id: id ?? "__antd_static_header__" });
+  if (!id) return <th style={style} {...rest} />;
+
+  const dragStyle: React.CSSProperties = {
+    ...style,
+    cursor: sortable.isDragging ? "grabbing" : "grab",
+    transform: CSS.Translate.toString(sortable.transform),
+    transition: sortable.transition,
+    ...(sortable.isDragging
+      ? { position: "relative", zIndex: 9999, background: "#f0f5ff" }
+      : {}),
+    userSelect: "none",
+  };
+  return (
+    <th
+      {...rest}
+      ref={sortable.setNodeRef}
+      style={dragStyle}
+      {...sortable.attributes}
+      {...sortable.listeners}
     />
   );
+};
+
+// ── localStorage hydration helpers ──────────────────────────────────────────
+
+const loadVisible = (defaults: string[]): string[] => {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw) as PersistedShape;
+    if (Array.isArray(parsed.visible) && parsed.visible.every((s) => typeof s === "string")) {
+      return parsed.visible as string[];
+    }
+  } catch {
+    // fall through to defaults
+  }
+  return defaults;
+};
+
+const loadCustom = (): string[] => {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as PersistedShape;
+    if (Array.isArray(parsed.custom) && parsed.custom.every((s) => typeof s === "string")) {
+      return parsed.custom as string[];
+    }
+  } catch {
+    // fall through to empty
+  }
+  return [];
 };
